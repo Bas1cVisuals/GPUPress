@@ -1,5 +1,3 @@
-from copy import deepcopy
-from fractions import Fraction
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -43,8 +41,35 @@ from app.ui.settings_widget import (
     SettingsManager,
 )
 from app.core.hardware import HardwareInfo
-from app.core.media import MediaInfo
-from app.core.presets import get_preset, PRESETS
+from app.core.batch import (
+    BatchJobSnapshot,
+    SUPPORTED_MEDIA_EXTENSIONS,
+    discover_media_files,
+    relative_output_directory,
+    unique_output_path,
+)
+from app.core.media import MediaAnalysis, MediaInfo
+from app.core.encoding_plan import (
+    AudioMode,
+    Codec,
+    FPSMode,
+    HDRMode,
+    RateControl,
+    ResolutionMode,
+    create_encoding_plan,
+    resolve_encoding_pipelines,
+)
+from app.core.presets import get_preset
+from app.ui.encoding_controls import (
+    adaptive_control_visibility,
+    build_user_options,
+    codec_choice_key,
+    codec_choices,
+    containers_for_codec,
+    format_media_summary,
+    format_plan_summary,
+    parse_audio_bitrate,
+)
 from app.workers.compression_worker import CompressionWorker
 
 
@@ -205,155 +230,108 @@ class SettingsGuideDialog(QDialog):
     GUIDE = {
         "Presets": {
             "Preset": (
-                "A preset automatically fills the main compression "
-                "settings for a specific workflow.\n\n"
-                "Reel presets are aimed at social-media style exports, "
-                "while Video presets are intended for general video."
+                "A preset selects encoding intent for a workflow. Review the "
+                "output plan before starting; the resolved output also "
+                "depends on the analyzed source and available encoders."
             ),
-
-            "Reel — 1080p": (
-                "Balanced preset for vertical reels and standard "
-                "1080p social-media exports.\n\n"
-                "Maximum resolution: 1920\n"
-                "Quality: CQ 18\n"
-                "Frame rate: 30 FPS\n"
-                "Encoder: NVENC P6"
-            ),
-
-            "Reel — 4K": (
-                "Keeps the output capable of retaining 4K resolution "
-                "when the source is 4K.\n\n"
-                "Quality: CQ 18\n"
-                "Frame rate: 30 FPS\n"
-                "Encoder: NVENC P6"
-            ),
-
-            "Video — 1080p": (
-                "General-purpose 1080p compression preset.\n\n"
-                "Useful when you want a smaller Full HD file without "
-                "changing the overall workflow."
-            ),
-
-            "Video — 4K": (
-                "General-purpose 4K compression preset.\n\n"
-                "Useful when the source is already high resolution and "
-                "you want to retain up to 4K."
-            ),
-
-            "Maximum Compatibility": (
-                "Prioritizes broad playback compatibility over maximum "
-                "compression efficiency.\n\n"
-                "Uses H.264 with a slightly more conservative quality "
-                "and encoder configuration."
-            ),
-
-            "High Quality": (
-                "Prioritizes image quality over file size.\n\n"
-                "Uses a lower CQ value and keeps the original frame rate."
-            ),
-
-            "Small File": (
-                "Prioritizes a smaller output file.\n\n"
-                "Uses a higher CQ value and lower audio bitrate."
-            ),
-
-            "Custom": (
-                "Lets you manually control the compression settings."
-            ),
+            "Fast Web / Social": "Delivery-oriented H.264 settings for web and social exports.",
+            "High Quality Delivery": "Higher-quality delivery intent; file size and visual results depend on the source and encoder.",
+            "Small File": "Uses stronger compression intent; output is not guaranteed to be smaller.",
+            "Maximum Compatibility": "Selects H.264 and AAC-oriented compatibility settings where applicable.",
+            "Editing proxies": "H.264 Proxy presets create smaller-resolution H.264 files for editing workflows.",
+            "Fast Scrub H.264": "Uses a shorter keyframe interval to support seeking; this can increase output size.",
+            "ProRes and DNxHR": "Creates editing intermediates in the selected profile. These files may be substantially larger than delivery encodes.",
+            "Original / Source Quality": "Keeps source resolution and requests source-oriented quality. This is not lossless encoding.",
+            "Custom": "Use the available controls to specify codec, dimensions, frame rate, rate control, audio, and other options.",
         },
 
         "Video": {
-            "Max Resolution": (
-                "Sets the maximum output dimension.\n\n"
-                "The compressor will not upscale a smaller source. "
-                "When downscaling, the original aspect ratio is preserved.\n\n"
-                "1920 → Full HD\n"
-                "2560 → 1440p-class output\n"
-                "3840 → 4K-class output"
+            "Resolution": (
+                "Selects an adaptive target tier, source dimensions, or "
+                "custom dimensions. Aspect ratio is preserved by default; "
+                "smaller footage is not enlarged unless upscaling is enabled."
             ),
-
             "Codec": (
-                "Controls the video compression format.\n\n"
-                "H.264 — maximum compatibility and widely supported.\n\n"
-                "HEVC / H.265 — generally more efficient compression "
-                "but can have lower playback compatibility."
+                "Selects the requested output codec. H.264, HEVC, AV1, "
+                "ProRes, and DNxHR choices depend on the installed FFmpeg "
+                "encoders. Fallbacks retain the requested codec; GPUPress "
+                "does not silently substitute a different codec."
             ),
-
-            "CQ Quality": (
-                "Controls constant-quality encoding.\n\n"
-                "LOWER CQ = higher visual quality + larger file.\n\n"
-                "HIGHER CQ = more compression + smaller file.\n\n"
-                "Typical guide:\n"
-                "16 → very high quality\n"
-                "18 → balanced\n"
-                "20 → more compression\n"
-                "23 → smaller file"
-            ),
-
             "Frame Rate": (
-                "Controls the output frame rate.\n\n"
-                "Original keeps the source frame rate.\n\n"
-                "24 / 25 / 30 / 50 / 60 forces the selected output "
-                "frame rate."
+                "Auto/Source keeps the detected cadence where possible; "
+                "explicit rates request constant-frame-rate output. VFR "
+                "detection samples an initial packet window and is an estimate. "
+                "GPUPress does not force every input to 30 FPS."
             ),
-
+            "Quality and rate control": (
+                "Quality values and bitrate controls are encoder-dependent. "
+                "A quality setting does not guarantee a particular visual "
+                "result, output size, or compression ratio."
+            ),
             "NVENC Preset": (
-                "Controls the NVIDIA hardware encoder's speed/quality "
-                "trade-off.\n\n"
-                "P1 → faster encoding\n"
-                "P7 → slower encoding with more encoder optimization\n\n"
-                "P5/P6 are useful balanced choices."
+                "Selects an NVIDIA encoder preset when a compatible NVENC "
+                "encoder is available. Hardware, driver, input, and FFmpeg "
+                "support affect whether a particular encode succeeds."
             ),
         },
 
         "Audio": {
-            "Audio Codec": (
-                "AAC re-encodes the audio for a predictable compressed "
-                "output.\n\n"
-                "Copy keeps the existing audio stream when the output "
-                "container/codec combination allows it."
+            "Auto / Copy / AAC": (
+                "Auto prefers copying audio when compatible with the output "
+                "container and otherwise uses AAC fallback. Copy explicitly "
+                "requests passthrough; AAC explicitly requests encoding."
             ),
-
             "Bitrate": (
-                "Controls the audio bitrate when AAC encoding is used.\n\n"
-                "Higher bitrate generally means better audio quality "
-                "and a slightly larger file.\n\n"
-                "192k is a practical general-purpose setting."
+                "The audio bitrate, sample rate, and channel controls apply "
+                "when AAC encoding is selected. Copy retains the source audio "
+                "stream's encoding properties."
             ),
-
             "Channels": (
-                "Controls the number of audio channels in the output.\n\n"
-                "Stereo → 2 channels\n"
-                "Mono → 1 channel"
+                "Choose the output channel count when encoding AAC. Audio "
+                "passthrough does not apply this conversion."
+            ),
+        },
+
+        "HDR": {
+            "HDR handling": (
+                "Auto and Preserve request HDR signaling and a 10-bit-capable "
+                "output path where supported. Output checks verify exposed "
+                "metadata and bit depth; they do not establish visual or "
+                "colorimetric HDR fidelity."
+            ),
+            "Tone Map to SDR": (
+                "HDR-to-SDR tone mapping is not implemented. This option is "
+                "disabled and requests are rejected rather than silently "
+                "converted."
+            ),
+            "Dolby Vision": (
+                "Dolby Vision metadata may be detected, but dynamic metadata "
+                "preservation during re-encoding is unsupported. Such "
+                "re-encoding is rejected."
             ),
         },
 
         "Processing": {
             "NVIDIA GPU Acceleration": (
-                "Uses the NVIDIA GPU hardware acceleration path when "
-                "supported by FFmpeg and your GPU.\n\n"
-                "This is the preferred BAS1C processing path because "
-                "NVENC can perform hardware video encoding."
+                "Uses available NVIDIA decode, CUDA scaling, and NVENC paths. "
+                "Capability listings do not guarantee every device/driver "
+                "combination will encode successfully."
             ),
-
             "CPU Fallback": (
-                "Allows the compressor to fall back to another encoding "
-                "path if the preferred NVIDIA hardware path cannot be used."
+                "Allows a software path for the selected codec when the "
+                "preferred hardware path fails. The requested codec is not "
+                "silently changed."
             ),
-
             "Copy Metadata": (
-                "Copies metadata from the source into the output when "
-                "supported by the output container.\n\n"
-                "Disable this if you want a cleaner output without "
-                "source metadata."
+                "Copies supported source metadata. Container and codec "
+                "limitations may prevent some metadata from being retained."
             ),
-
             "Enable Faststart": (
-                "Moves MP4 metadata required for progressive playback "
-                "toward the beginning of the file.\n\n"
-                "Useful for videos intended for web delivery or "
-                "streaming-style playback."
+                "Moves supported MP4/MOV index data toward the beginning "
+                "of the file for progressive playback."
             ),
+            "Folder queue": "Add Folder scans supported video extensions. Include subfolders enables recursive discovery; symbolic links and the selected output directory are excluded.",
+            "Cancellation": "Cancelling terminates the active job and pauses pending jobs. Completed outputs remain available.",
         },
     }
 
@@ -737,12 +715,19 @@ class QueueItemWidget(Card):
         self.worker = None
 
         self.finished = False
+        self.job_state = "Pending"
+        self.error_detail = ""
+        self.encoding_options = None
+        self.output_file_path = None
+        self.source_root = None
 
         self.input_size = 0
 
         self.output_size = 0
 
         self.duration = 0
+        self.media_analysis = None
+        self.encoding_options = None
 
         self.build_ui()
 
@@ -955,6 +940,13 @@ class QueueItemWidget(Card):
     def set_media_info(self, info):
 
         if not info:
+            return
+
+        if isinstance(info, MediaAnalysis):
+            self.media_analysis = info
+            self.input_size = int(info.size or 0)
+            self.duration = float(info.duration or 0)
+            self.media_label.setText(format_media_summary(info))
             return
 
         width = info.get(
@@ -1315,11 +1307,13 @@ class MainWindow(QMainWindow):
             settings_manager
             or SettingsManager()
         )
-        self.audio_sample_rate = 48000
         self.overwrite_existing = False
         self.auto_open_output = False
         self.queue_succeeded = False
         self.last_output_dir = None
+        self._queue_encoding_options = None
+        self._batch_output_root = None
+        self._reserved_outputs = set()
 
         self.hardware = HardwareInfo()
 
@@ -1586,13 +1580,20 @@ class MainWindow(QMainWindow):
         self.preset_combo = QComboBox()
 
         self.preset_items = [
-            ("Reel — 1080p", "reel_1080p"),
-            ("Reel — 4K", "reel_4k"),
-            ("Video — 1080p", "video_1080p"),
-            ("Video — 4K", "video_4k"),
+            ("Fast Web / Social", "fast_web_social"),
+            ("High Quality Delivery", "high_quality_delivery"),
+            ("Small File", "small_file_delivery"),
             ("Maximum Compatibility", "compatibility"),
-            ("High Quality", "quality"),
-            ("Small File", "small_file"),
+            ("H.264 Proxy 720p", "h264_proxy_720p"),
+            ("H.264 Proxy 1080p", "h264_proxy_1080p"),
+            ("Fast Scrub H.264", "fast_scrub_h264"),
+            ("ProRes Proxy", "prores_proxy"),
+            ("ProRes LT", "prores_lt"),
+            ("ProRes 422", "prores_422"),
+            ("DNxHR LB", "dnxhr_lb"),
+            ("DNxHR SQ", "dnxhr_sq"),
+            ("DNxHR HQ", "dnxhr_hq"),
+            ("Original / Source Quality", "original_source_quality"),
             ("Custom", "custom"),
         ]
 
@@ -1617,160 +1618,163 @@ class MainWindow(QMainWindow):
         # RESOLUTION
         # -----------------------------------------------------
 
-        self.settings_grid.addWidget(
-            QLabel("Max Resolution"),
-            1,
-            0
-        )
+        self.resolution_label = QLabel("Resolution")
+        self.settings_grid.addWidget(self.resolution_label, 1, 0)
 
         self.resolution_combo = QComboBox()
-
-        self.resolution_combo.addItem(
-            "1920",
-            1920
-        )
-
-        self.resolution_combo.addItem(
-            "2560",
-            2560
-        )
-
-        self.resolution_combo.addItem(
-            "3840",
-            3840
-        )
-
+        for label, mode in (
+            ("Adaptive / Auto", ResolutionMode.AUTO),
+            ("Source", ResolutionMode.SOURCE),
+            ("720p", ResolutionMode.P720),
+            ("1080p", ResolutionMode.P1080),
+            ("1440p", ResolutionMode.P1440),
+            ("2160p / 4K", ResolutionMode.P2160),
+            ("Custom", ResolutionMode.CUSTOM),
+        ):
+            self.resolution_combo.addItem(label, mode.value)
         self.settings_grid.addWidget(
             self.resolution_combo,
             1,
             1
         )
+        self.custom_resolution_widget = QWidget()
+        custom_resolution_layout = QHBoxLayout(self.custom_resolution_widget)
+        custom_resolution_layout.setContentsMargins(0, 0, 0, 0)
+        self.custom_width_spin = QSpinBox()
+        self.custom_width_spin.setRange(2, 16384)
+        self.custom_width_spin.setValue(1920)
+        self.custom_width_spin.setPrefix("W ")
+        self.custom_height_spin = QSpinBox()
+        self.custom_height_spin.setRange(2, 16384)
+        self.custom_height_spin.setValue(1080)
+        self.custom_height_spin.setPrefix("H ")
+        self.aspect_ratio_check = QCheckBox("Keep aspect ratio")
+        self.aspect_ratio_check.setChecked(True)
+        self.allow_upscale_check = QCheckBox("Allow upscale")
+        custom_resolution_layout.addWidget(self.custom_width_spin)
+        custom_resolution_layout.addWidget(self.custom_height_spin)
+        custom_resolution_layout.addWidget(self.aspect_ratio_check)
+        custom_resolution_layout.addWidget(self.allow_upscale_check)
+        self.settings_grid.addWidget(self.custom_resolution_widget, 2, 0, 1, 2)
 
         # -----------------------------------------------------
         # CODEC
         # -----------------------------------------------------
 
-        self.settings_grid.addWidget(
-            QLabel("Codec"),
-            2,
-            0
-        )
+        self.codec_label = QLabel("Codec")
+        self.settings_grid.addWidget(self.codec_label, 3, 0)
 
         self.codec_combo = QComboBox()
+        self.codec_choices_by_key = {
+            choice.key: choice
+            for choice in codec_choices(self.hardware.get_capabilities())
+        }
+        for index in range(self.preset_combo.count()):
+            preset_id = self.preset_combo.itemData(index)
+            if preset_id == "custom":
+                continue
+            preset_options = get_preset(preset_id).to_user_options()
+            has_codec = any(
+                choice.codec is preset_options.codec
+                for choice in self.codec_choices_by_key.values()
+            )
+            if not has_codec:
+                self.preset_combo.model().item(index).setEnabled(False)
+        for choice in self.codec_choices_by_key.values():
+            self.codec_combo.addItem(choice.label, choice.key)
+        self.settings_grid.addWidget(self.codec_combo, 3, 1)
 
-        self.codec_combo.addItem(
-            "H.264",
-            "h264"
-        )
-
-        self.codec_combo.addItem(
-            "HEVC / H.265",
-            "hevc"
-        )
-
-        self.settings_grid.addWidget(
-            self.codec_combo,
-            2,
-            1
-        )
-
-        # -----------------------------------------------------
-        # CQ
-        # -----------------------------------------------------
-
-        self.settings_grid.addWidget(
-            QLabel("CQ Quality"),
-            3,
-            0
-        )
+        self.quality_label = QLabel("Rate control")
+        self.settings_grid.addWidget(self.quality_label, 4, 0)
+        self.rate_control_combo = QComboBox()
+        self.rate_control_combo.addItem("Quality", RateControl.CQ.value)
+        self.rate_control_combo.addItem("Bitrate", RateControl.VBR.value)
+        self.rate_control_combo.addItem("CBR", RateControl.CBR.value)
+        self.settings_grid.addWidget(self.rate_control_combo, 4, 1)
 
         self.cq_spin = QSpinBox()
-
-        self.cq_spin.setRange(
-            1,
-            51
-        )
-
-        self.cq_spin.setValue(
-            18
-        )
-
-        self.settings_grid.addWidget(
-            self.cq_spin,
-            3,
-            1
-        )
+        self.cq_spin.setRange(1, 51)
+        self.cq_spin.setValue(18)
+        self.cq_spin.setPrefix("Quality ")
+        self.bitrate_spin = QSpinBox()
+        self.bitrate_spin.setRange(100, 200000)
+        self.bitrate_spin.setValue(12000)
+        self.bitrate_spin.setSuffix(" kbps")
+        self.quality_value_widget = QWidget()
+        quality_value_layout = QHBoxLayout(self.quality_value_widget)
+        quality_value_layout.setContentsMargins(0, 0, 0, 0)
+        quality_value_layout.addWidget(self.cq_spin)
+        quality_value_layout.addWidget(self.bitrate_spin)
+        self.settings_grid.addWidget(self.quality_value_widget, 5, 0, 1, 2)
 
         # -----------------------------------------------------
         # FPS
         # -----------------------------------------------------
 
-        self.settings_grid.addWidget(
-            QLabel("Frame Rate"),
-            4,
-            0
-        )
+        self.fps_label = QLabel("Frame rate")
+        self.settings_grid.addWidget(self.fps_label, 6, 0)
 
         self.fps_combo = QComboBox()
-
-        for label in [
-            "Original",
-            "24",
-            "25",
-            "30",
-            "50",
-            "60",
-        ]:
-
-            self.fps_combo.addItem(
-                label
-            )
-
-        self.fps_combo.setCurrentText(
-            "30"
-        )
-
-        self.settings_grid.addWidget(
-            self.fps_combo,
-            4,
-            1
-        )
+        self.fps_combo.addItem("Source / Smart", "smart")
+        for rate in ("23.976", "24", "25", "29.97", "30", "50", "59.94", "60"):
+            self.fps_combo.addItem(f"{rate} FPS", rate)
+        self.fps_combo.addItem("Custom", "custom")
+        self.settings_grid.addWidget(self.fps_combo, 6, 1)
+        self.custom_fps_spin = QDoubleSpinBox()
+        self.custom_fps_spin.setRange(1.0, 240.0)
+        self.custom_fps_spin.setDecimals(3)
+        self.custom_fps_spin.setValue(30.0)
+        self.custom_fps_spin.setSuffix(" FPS")
+        self.settings_grid.addWidget(self.custom_fps_spin, 7, 1)
 
         # -----------------------------------------------------
         # ENCODER PRESET
         # -----------------------------------------------------
 
-        self.settings_grid.addWidget(
-            QLabel("NVENC Preset"),
-            5,
-            0
-        )
+        self.encoder_label = QLabel("NVENC preset")
+        self.settings_grid.addWidget(self.encoder_label, 8, 0)
 
         self.encoder_combo = QComboBox()
+        for label, preset in (
+            ("P1 Fastest", "p1"), ("P3 Fast", "p3"),
+            ("P5 Balanced", "p5"), ("P6 Quality", "p6"),
+            ("P7 Highest Quality", "p7"),
+        ):
+            self.encoder_combo.addItem(label, preset)
+        self.encoder_combo.setCurrentIndex(3)
+        self.settings_grid.addWidget(self.encoder_combo, 8, 1)
 
-        for preset in [
-            "p1",
-            "p2",
-            "p3",
-            "p4",
-            "p5",
-            "p6",
-            "p7",
-        ]:
+        self.gop_label = QLabel("Keyframe interval")
+        self.settings_grid.addWidget(self.gop_label, 9, 0)
+        self.gop_spin = QSpinBox()
+        self.gop_spin.setRange(0, 1000)
+        self.gop_spin.setSpecialValueText("Automatic")
+        self.gop_spin.setValue(0)
+        self.settings_grid.addWidget(self.gop_spin, 9, 1)
 
-            self.encoder_combo.addItem(
-                preset
-            )
+        self.hardware_label_option = QLabel("Encoding hardware")
+        self.settings_grid.addWidget(self.hardware_label_option, 10, 0)
+        self.hardware_combo = QComboBox()
+        self.hardware_combo.addItem("Auto", "auto")
+        self.hardware_combo.addItem("CPU", "cpu")
+        self.hardware_combo.addItem("NVIDIA GPU", "gpu")
+        if not any(choice.prefer_gpu for choice in self.codec_choices_by_key.values()):
+            gpu_index = self.hardware_combo.findData("gpu")
+            self.hardware_combo.model().item(gpu_index).setEnabled(False)
+        self.settings_grid.addWidget(self.hardware_combo, 10, 1)
+        self.capability_label = QLabel()
+        self.capability_label.setWordWrap(True)
+        self.capability_label.setObjectName("hardwareStatus")
+        self.settings_grid.addWidget(self.capability_label, 11, 0, 1, 2)
+        self.output_summary_label = QLabel("Output plan will appear when media is analyzed.")
+        self.output_summary_label.setWordWrap(True)
+        self.output_summary_label.setObjectName("hardwareStatus")
+        self.settings_grid.addWidget(self.output_summary_label, 12, 0, 1, 2)
 
-        self.encoder_combo.setCurrentText(
-            "p6"
-        )
-
-        self.settings_grid.addWidget(
-            self.encoder_combo,
-            5,
-            1
-        )
+        self.container_label = QLabel("Container")
+        self.settings_grid.addWidget(self.container_label, 13, 0)
+        self.container_combo = QComboBox()
+        self.settings_grid.addWidget(self.container_combo, 13, 1)
 
         self.settings_layout.addLayout(
             self.settings_grid
@@ -1811,13 +1815,18 @@ class MainWindow(QMainWindow):
         self.audio_combo = QComboBox()
 
         self.audio_combo.addItem(
+            "Auto (copy when compatible)",
+            AudioMode.AUTO.value
+        )
+
+        self.audio_combo.addItem(
             "AAC",
-            "aac"
+            AudioMode.AAC.value
         )
 
         self.audio_combo.addItem(
             "Copy",
-            "copy"
+            AudioMode.COPY.value
         )
 
         self.audio_grid.addWidget(
@@ -1826,8 +1835,9 @@ class MainWindow(QMainWindow):
             1
         )
 
+        self.audio_bitrate_label = QLabel("Bitrate")
         self.audio_grid.addWidget(
-            QLabel("Bitrate"),
+            self.audio_bitrate_label,
             1,
             0
         )
@@ -1843,7 +1853,8 @@ class MainWindow(QMainWindow):
         ]:
 
             self.audio_bitrate_combo.addItem(
-                value
+                value,
+                value,
             )
 
         self.audio_bitrate_combo.setCurrentText(
@@ -1856,8 +1867,9 @@ class MainWindow(QMainWindow):
             1
         )
 
+        self.audio_channels_label = QLabel("Channels")
         self.audio_grid.addWidget(
-            QLabel("Channels"),
+            self.audio_channels_label,
             2,
             0
         )
@@ -1880,9 +1892,27 @@ class MainWindow(QMainWindow):
             1
         )
 
+        self.audio_sample_rate_label = QLabel("Sample rate")
+        self.audio_grid.addWidget(self.audio_sample_rate_label, 3, 0)
+        self.audio_sample_rate_combo = QComboBox()
+        self.audio_sample_rate_combo.addItem("44.1 kHz", 44100)
+        self.audio_sample_rate_combo.addItem("48 kHz", 48000)
+        self.audio_sample_rate_combo.setCurrentIndex(1)
+        self.audio_grid.addWidget(self.audio_sample_rate_combo, 3, 1)
+
         self.settings_layout.addLayout(
             self.audio_grid
         )
+
+        self.hdr_grid = QGridLayout()
+        self.hdr_grid.addWidget(QLabel("HDR handling"), 0, 0)
+        self.hdr_combo = QComboBox()
+        self.hdr_combo.addItem("Auto", HDRMode.AUTO.value)
+        self.hdr_combo.addItem("Preserve", HDRMode.PRESERVE.value)
+        self.hdr_combo.addItem("Tone Map to SDR — Coming soon", HDRMode.TONE_MAP_SDR.value)
+        self.hdr_combo.model().item(2).setEnabled(False)
+        self.hdr_grid.addWidget(self.hdr_combo, 0, 1)
+        self.settings_layout.addLayout(self.hdr_grid)
 
         # =====================================================
         # OPTIONS
@@ -1907,6 +1937,7 @@ class MainWindow(QMainWindow):
         self.gpu_check.setChecked(
             True
         )
+        self.gpu_check.hide()
 
         self.settings_layout.addWidget(
             self.gpu_check
@@ -1947,6 +1978,25 @@ class MainWindow(QMainWindow):
         self.settings_layout.addWidget(
             self.faststart_check
         )
+
+        self.codec_combo.currentIndexChanged.connect(self.update_adaptive_controls)
+        self.resolution_combo.currentIndexChanged.connect(self.update_adaptive_controls)
+        self.fps_combo.currentIndexChanged.connect(self.update_adaptive_controls)
+        self.rate_control_combo.currentIndexChanged.connect(self.update_adaptive_controls)
+        self.audio_combo.currentIndexChanged.connect(self.update_adaptive_controls)
+        self.hardware_combo.currentIndexChanged.connect(self.update_adaptive_controls)
+        self.container_combo.currentIndexChanged.connect(self.refresh_output_preview)
+        for control in (
+            self.custom_width_spin, self.custom_height_spin, self.custom_fps_spin,
+            self.cq_spin, self.bitrate_spin, self.gop_spin,
+            self.audio_bitrate_combo, self.audio_channels_combo,
+            self.audio_sample_rate_combo, self.hdr_combo,
+            self.aspect_ratio_check, self.allow_upscale_check,
+            self.metadata_check, self.faststart_check, self.fallback_check,
+        ):
+            signal = getattr(control, "valueChanged", None) or getattr(control, "currentIndexChanged", None) or getattr(control, "toggled", None)
+            if signal is not None:
+                signal.connect(self.refresh_output_preview)
 
         self.settings_layout.addStretch(
             1
@@ -2049,9 +2099,12 @@ class MainWindow(QMainWindow):
             self.add_folder
         )
 
-        self.input_layout.addWidget(
-            self.add_folder_button
-        )
+        self.folder_options = QHBoxLayout()
+        self.recursive_check = QCheckBox("Include subfolders")
+        self.folder_options.addWidget(self.add_folder_button)
+        self.folder_options.addWidget(self.recursive_check)
+        self.folder_options.addStretch(1)
+        self.input_layout.addLayout(self.folder_options)
 
         self.right_layout.addWidget(
             self.input_card
@@ -2081,6 +2134,15 @@ class MainWindow(QMainWindow):
         self.queue_header.addWidget(self.clear_queue_button)
 
         self.queue_layout.addLayout(self.queue_header)
+        self.batch_status_label = QLabel("Ready")
+        self.batch_status_label.setObjectName("QueueStatus")
+        self.queue_layout.addWidget(self.batch_status_label)
+        self.batch_progress_bar = QProgressBar()
+        self.batch_progress_bar.setRange(0, 100)
+        self.batch_progress_bar.setValue(0)
+        self.batch_progress_bar.setTextVisible(False)
+        self.batch_progress_bar.setFixedHeight(5)
+        self.queue_layout.addWidget(self.batch_progress_bar)
 
         self.queue_scroll = QScrollArea()
         self.queue_scroll.setObjectName("QueueScroll")
@@ -2935,43 +2997,26 @@ class MainWindow(QMainWindow):
             {}
         )
 
-        self.preset_combo.setCurrentIndex(
-            max(
-                0,
-                self.preset_combo.findData(
-                    "custom"
-                )
-            )
-        )
+        self.preset_combo.setCurrentIndex(max(0, self.preset_combo.findData("custom")))
+        selected_codec = str(video.get("codec_choice", ""))
+        if selected_codec not in self.codec_choices_by_key:
+            selected_codec = self._legacy_codec_choice(video.get("codec", "h264"))
+        self._set_combo_data(self.codec_combo, selected_codec)
 
-        self.codec_combo.setCurrentIndex(
-            max(
-                0,
-                self.codec_combo.findData(
-                    video.get("codec", "h264")
-                )
-            )
-        )
-
-        try:
-            resolution = int(
-                video.get(
-                    "max_resolution",
-                    1920
-                )
-            )
-        except (TypeError, ValueError):
-            resolution = 1920
-
-        resolution_index = (
-            self.resolution_combo.findData(
-                resolution
-            )
-        )
-        if resolution_index >= 0:
-            self.resolution_combo.setCurrentIndex(
-                resolution_index
-            )
+        legacy_resolution = str(video.get("max_resolution", ""))
+        resolution_mode = video.get("resolution_mode")
+        if not resolution_mode:
+            resolution_mode = {
+                "1280": ResolutionMode.P720.value,
+                "1920": ResolutionMode.P1080.value,
+                "2560": ResolutionMode.P1440.value,
+                "3840": ResolutionMode.P2160.value,
+            }.get(legacy_resolution, ResolutionMode.AUTO.value)
+        self._set_combo_data(self.resolution_combo, resolution_mode)
+        self.custom_width_spin.setValue(int(video.get("custom_width", 1920)))
+        self.custom_height_spin.setValue(int(video.get("custom_height", 1080)))
+        self.aspect_ratio_check.setChecked(bool(video.get("preserve_aspect_ratio", True)))
+        self.allow_upscale_check.setChecked(bool(video.get("allow_upscale", False)))
 
         try:
             self.cq_spin.setValue(
@@ -2980,29 +3025,42 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             self.cq_spin.setValue(18)
 
-        fps = str(
-            video.get("fps", "30")
+        fps = str(video.get("fps_mode", video.get("fps", "smart"))).lower()
+        if fps in ("original", "source", "auto", "smart"):
+            fps = "smart"
+        if fps not in ("smart", "custom") and fps not in {
+            self.fps_combo.itemData(index)
+            for index in range(self.fps_combo.count())
+        }:
+            fps = "smart"
+        self._set_combo_data(self.fps_combo, fps)
+        try:
+            self.custom_fps_spin.setValue(float(video.get("custom_fps", 30)))
+        except (TypeError, ValueError):
+            self.custom_fps_spin.setValue(30)
+        self._set_combo_data(
+            self.rate_control_combo,
+            video.get("rate_control", RateControl.CQ.value),
         )
-        self.fps_combo.setCurrentText(
-            "Original"
-            if fps.lower() == "original"
-            else fps
+        self.bitrate_spin.setValue(int(video.get("bitrate_kbps", 12000)))
+        self._set_combo_data(
+            self.encoder_combo,
+            video.get("nvenc_preset", "p6"),
         )
+        self.gop_spin.setValue(int(video.get("gop_size", 0) or 0))
 
-        self.encoder_combo.setCurrentText(
-            str(
-                video.get(
-                    "nvenc_preset",
-                    "p6"
-                )
-            )
-        )
-
+        audio_mode = str(audio.get("mode", audio.get("codec", "auto"))).lower()
+        if audio_mode == "aac":
+            audio_mode = AudioMode.AAC.value
+        elif audio_mode == "copy":
+            audio_mode = AudioMode.COPY.value
+        else:
+            audio_mode = AudioMode.AUTO.value
         self.audio_combo.setCurrentIndex(
             max(
                 0,
                 self.audio_combo.findData(
-                    audio.get("codec", "aac")
+                    audio_mode
                 )
             )
         )
@@ -3033,20 +3091,22 @@ class MainWindow(QMainWindow):
             pass
 
         try:
-            self.audio_sample_rate = int(
-                audio.get("sample_rate", 48000)
-            )
+            sample_rate = int(audio.get("sample_rate", 48000))
         except (TypeError, ValueError):
-            self.audio_sample_rate = 48000
+            sample_rate = 48000
+        self._set_combo_data(self.audio_sample_rate_combo, sample_rate)
+        self._set_combo_data(self.hdr_combo, video.get("hdr_mode", "auto"))
+        self.preferred_container = video.get("container")
 
-        self.gpu_check.setChecked(
-            bool(
-                processing.get(
-                    "gpu_acceleration",
-                    True
-                )
+        hardware_mode = video.get("hardware_mode")
+        if hardware_mode not in ("auto", "gpu", "cpu"):
+            hardware_mode = (
+                "auto"
+                if processing.get("gpu_acceleration", True)
+                else "cpu"
             )
-        )
+        self._set_combo_data(self.hardware_combo, hardware_mode)
+        self.gpu_check.setChecked(hardware_mode != "cpu")
 
         self.fallback_check.setChecked(
             bool(
@@ -3111,6 +3171,10 @@ class MainWindow(QMainWindow):
         self.output_edit.setText(
             str(output_path)
         )
+        self.update_adaptive_controls()
+        if self.preferred_container:
+            self._set_combo_data(self.container_combo, self.preferred_container)
+            self.refresh_output_preview()
 
     def open_settings_guide(self):
 
@@ -3130,133 +3194,285 @@ class MainWindow(QMainWindow):
         if not preset_id:
             return
 
-        preset = get_preset(
-            preset_id
+        if preset_id == "custom":
+            self.update_adaptive_controls()
+            self.refresh_output_preview()
+            return
+        preset = get_preset(preset_id)
+        options = preset.to_user_options()
+        codec_key = codec_choice_key(options.codec, options.prefer_gpu)
+        if codec_key not in self.codec_choices_by_key:
+            software_choice = next(
+                (
+                    choice.key
+                    for choice in self.codec_choices_by_key.values()
+                    if choice.codec is options.codec
+                ),
+                None,
+            )
+            if software_choice is None:
+                self.append_log(
+                    f"[WARNING] {preset.name} is unavailable because its encoder "
+                    "is not present in this FFmpeg installation."
+                )
+                self._set_combo_data(self.preset_combo, "custom")
+                return
+            codec_key = software_choice
+        self._set_combo_data(self.codec_combo, codec_key)
+        self._set_combo_data(self.resolution_combo, options.resolution_mode.value)
+        self._set_combo_data(self.fps_combo, self._preset_fps_value(options))
+        self._set_combo_data(self.audio_combo, options.audio_mode.value)
+        self._set_combo_data(self.hdr_combo, options.hdr_mode.value)
+        self._set_combo_data(self.rate_control_combo, options.rate_control.value)
+        if options.quality is not None:
+            self.cq_spin.setValue(max(self.cq_spin.minimum(), min(self.cq_spin.maximum(), int(options.quality))))
+        if options.audio_fallback_bitrate:
+            self.audio_bitrate_combo.setCurrentText(
+                f"{options.audio_fallback_bitrate // 1000}k"
+            )
+        if options.sample_rate:
+            self._set_combo_data(self.audio_sample_rate_combo, options.sample_rate)
+        if options.encoder_preset:
+            self._set_combo_data(self.encoder_combo, options.encoder_preset)
+        self.gop_spin.setValue(options.gop_size or 0)
+        self._set_combo_data(self.hardware_combo, "auto")
+        self.update_adaptive_controls()
+        self._set_combo_data(self.container_combo, options.container)
+        self.refresh_output_preview()
+
+    # =========================================================
+    # BUILD ENCODING INTENT
+    # =========================================================
+
+    @staticmethod
+    def _legacy_codec_choice(codec):
+        return {
+            "h264": "h264_nvenc",
+            "hevc": "hevc_nvenc",
+            "h265": "hevc_nvenc",
+            "av1": "av1_nvenc",
+        }.get(str(codec).lower(), "h264_software")
+
+    @staticmethod
+    def _preset_fps_value(options):
+        if options.fps_mode in (FPSMode.AUTO, FPSMode.SMART, FPSMode.SOURCE):
+            return "smart"
+        if options.custom_fps is not None:
+            return "custom"
+        if options.target_fps is not None:
+            return str(options.target_fps)
+        return "smart"
+
+    def build_current_options(self):
+        choice = self.codec_choices_by_key.get(self.codec_combo.currentData())
+        if choice is None:
+            raise ValueError("The selected video encoder is unavailable.")
+        hardware_mode = self.hardware_combo.currentData()
+        prefer_gpu = (
+            choice.prefer_gpu
+            if hardware_mode == "auto"
+            else hardware_mode == "gpu"
+        )
+        audio_mode = AudioMode(self.audio_combo.currentData())
+        fps_value = self.fps_combo.currentData()
+        resolution_mode = ResolutionMode(self.resolution_combo.currentData())
+        rate_control = RateControl(self.rate_control_combo.currentData())
+        bitrate = (
+            self.bitrate_spin.value() * 1000
+            if rate_control is not RateControl.CQ
+            else None
+        )
+        container = self.container_combo.currentData() or "mp4"
+        return build_user_options(
+            codec_key=choice.key,
+            resolution_mode=resolution_mode,
+            custom_width=self.custom_width_spin.value(),
+            custom_height=self.custom_height_spin.value(),
+            preserve_aspect_ratio=self.aspect_ratio_check.isChecked(),
+            allow_upscale=self.allow_upscale_check.isChecked(),
+            fps_value=fps_value,
+            custom_fps=self.custom_fps_spin.value(),
+            audio_mode=audio_mode,
+            audio_bitrate=parse_audio_bitrate(self.audio_bitrate_combo.currentData()),
+            sample_rate=self.audio_sample_rate_combo.currentData(),
+            channel_count=self.audio_channels_combo.currentData(),
+            hdr_mode=HDRMode(self.hdr_combo.currentData()),
+            rate_control=rate_control,
+            quality=self.cq_spin.value(),
+            bitrate=bitrate,
+            encoder_preset=self.encoder_combo.currentData(),
+            gop_size=self.gop_spin.value() or None,
+            container=container,
+            prefer_gpu=prefer_gpu,
+            allow_cpu_fallback=self.fallback_check.isChecked(),
+            preserve_metadata=self.metadata_check.isChecked(),
+            faststart=self.faststart_check.isChecked(),
         )
 
-        self.resolution_combo.setCurrentIndex(
-            max(
-                0,
-                self.resolution_combo.findData(
-                    preset.max_dimension
+    def update_adaptive_controls(self, *_):
+        choice = self.codec_choices_by_key.get(self.codec_combo.currentData())
+        codec = choice.codec if choice else Codec.H264
+        hardware_mode = self.hardware_combo.currentData()
+        if choice and hardware_mode in ("gpu", "cpu"):
+            desired_gpu = hardware_mode == "gpu"
+            if choice.prefer_gpu != desired_gpu:
+                desired_key = codec_choice_key(codec, desired_gpu)
+                if desired_key in self.codec_choices_by_key:
+                    self._set_combo_data(self.codec_combo, desired_key)
+                    choice = self.codec_choices_by_key[desired_key]
+                    codec = choice.codec
+                elif hardware_mode == "gpu":
+                    self._set_combo_data(self.hardware_combo, "auto")
+                    hardware_mode = "auto"
+                else:
+                    self._set_combo_data(self.hardware_combo, "auto")
+                    hardware_mode = "auto"
+        is_nvenc = bool(choice and choice.prefer_gpu)
+        visibility = adaptive_control_visibility(
+            codec=codec,
+            nvenc=is_nvenc,
+            resolution_mode=self.resolution_combo.currentData(),
+            fps_value=self.fps_combo.currentData(),
+            rate_control=self.rate_control_combo.currentData(),
+            audio_mode=self.audio_combo.currentData(),
+        )
+        self.custom_resolution_widget.setVisible(visibility["custom_resolution"])
+        self.custom_fps_spin.setVisible(visibility["custom_fps"])
+        self.cq_spin.setVisible(visibility["cq_value"])
+        self.bitrate_spin.setVisible(visibility["bitrate_value"])
+        self.encoder_label.setText(
+            "NVENC preset" if visibility["nvenc_preset"] else "Software preset"
+        )
+        self.encoder_label.setVisible(visibility["encoder_preset"])
+        self.encoder_combo.setVisible(visibility["encoder_preset"])
+        self.quality_label.setVisible(visibility["quality"])
+        self.rate_control_combo.setVisible(visibility["rate_control"])
+        self.quality_value_widget.setVisible(visibility["quality"])
+        self.gop_label.setVisible(visibility["gop"])
+        self.gop_spin.setVisible(visibility["gop"])
+        self.hardware_label_option.setVisible(visibility["hardware"])
+        self.hardware_combo.setVisible(visibility["hardware"])
+        self.encoder_combo.blockSignals(True)
+        self.encoder_combo.clear()
+        encoder_choices = (
+            (
+                ("P1 Fastest", "p1"), ("P3 Fast", "p3"),
+                ("P5 Balanced", "p5"), ("P6 Quality", "p6"),
+                ("P7 Highest Quality", "p7"),
+            )
+            if is_nvenc
+            else (
+                ("Ultrafast", "ultrafast"), ("Fast", "fast"),
+                ("Medium", "medium"), ("Slow", "slow"),
+                ("Very slow", "veryslow"),
+            )
+            if codec in (Codec.H264, Codec.HEVC)
+            else ()
+        )
+        for label, value in encoder_choices:
+            self.encoder_combo.addItem(label, value)
+        preferred_preset = (
+            "p6" if is_nvenc else "medium"
+        )
+        self._set_combo_data(self.encoder_combo, preferred_preset)
+        self.encoder_combo.blockSignals(False)
+        audio_is_encoded = visibility["audio_encoding"]
+        for widget in (
+            self.audio_bitrate_combo, self.audio_sample_rate_combo,
+            self.audio_channels_combo,
+        ):
+            widget.setVisible(audio_is_encoded)
+        for widget in (
+            self.audio_bitrate_label, self.audio_sample_rate_label,
+            self.audio_channels_label,
+        ):
+            widget.setVisible(audio_is_encoded)
+        self.container_combo.blockSignals(True)
+        old_container = self.container_combo.currentData()
+        self.container_combo.clear()
+        for container in containers_for_codec(codec):
+            self.container_combo.addItem(container.upper(), container)
+        if old_container in containers_for_codec(codec):
+            self._set_combo_data(self.container_combo, old_container)
+        self.container_combo.blockSignals(False)
+        gpu_enabled = (
+            codec in (Codec.H264, Codec.HEVC, Codec.AV1)
+            and codec_choice_key(codec, True) in self.codec_choices_by_key
+        )
+        cpu_enabled = (
+            codec in (Codec.H264, Codec.HEVC, Codec.AV1)
+            and codec_choice_key(codec, False) in self.codec_choices_by_key
+        )
+        gpu_index = self.hardware_combo.findData("gpu")
+        self.hardware_combo.model().item(gpu_index).setEnabled(gpu_enabled)
+        cpu_index = self.hardware_combo.findData("cpu")
+        self.hardware_combo.model().item(cpu_index).setEnabled(cpu_enabled)
+        if not gpu_enabled and self.hardware_combo.currentData() == "gpu":
+            self._set_combo_data(self.hardware_combo, "auto")
+        self.capability_label.setText(self._capability_summary())
+        self.refresh_output_preview()
+
+    def _capability_summary(self):
+        caps = self.hardware.get_capabilities()
+        gpu = caps.gpu_name or ("NVIDIA GPU detected" if caps.nvidia_available else "NVIDIA GPU unavailable")
+        check = lambda available: "Available" if available else "Unavailable"
+        return (
+            f"GPU: {gpu}  ·  NVENC H.264: {check(caps.h264_nvenc)}  ·  "
+            f"HEVC: {check(caps.hevc_nvenc)}  ·  AV1: {check(caps.av1_nvenc)}  ·  "
+            f"CUDA: {check(caps.cuda)}"
+        )
+
+    def refresh_output_preview(self, *_):
+        item = next(
+            (queue_item for queue_item in self.queue_items if queue_item.media_analysis),
+            None,
+        )
+        if item is None:
+            self.output_summary_label.setText(
+                "Output plan will appear when media is analyzed."
+            )
+            return
+        try:
+            options = self.build_current_options()
+            plan = create_encoding_plan(
+                item.media_analysis,
+                options,
+                self.hardware.get_capabilities(),
+            )
+            choice = self.codec_choices_by_key[self.codec_combo.currentData()]
+            pipelines = resolve_encoding_pipelines(
+                plan,
+                self.hardware.get_capabilities(),
+            )
+            if pipelines[0] == "gpu":
+                encoder_label = f"{choice.codec.value.upper()} NVENC · CUDA"
+            elif pipelines[0] == "nvenc":
+                encoder_label = f"{choice.codec.value.upper()} NVENC"
+            else:
+                encoder_label = (
+                    choice.label
+                    if choice.codec not in (Codec.H264, Codec.HEVC, Codec.AV1)
+                    else f"{choice.codec.value.upper()} Software"
+                )
+            self.output_summary_label.setText(
+                format_plan_summary(
+                    plan,
+                    encoder_label=encoder_label,
+                    gpu_name=(
+                        self.hardware.gpu_name
+                        if pipelines[0] in ("gpu", "nvenc")
+                        else None
+                    ),
                 )
             )
-        )
+        except (ValueError, KeyError) as error:
+            self.output_summary_label.setText(f"Output plan unavailable: {error}")
 
-        self.cq_spin.setValue(
-            preset.cq
-        )
-
-        fps = str(
-            preset.fps
-        )
-
-        if fps == "original":
-
-            self.fps_combo.setCurrentText(
-                "Original"
-            )
-
-        else:
-
-            self.fps_combo.setCurrentText(
-                fps
-            )
-
-        self.encoder_combo.setCurrentText(
-            preset.encoder_preset
-        )
-
-        self.audio_bitrate_combo.setCurrentText(
-            preset.audio_bitrate
-        )
-
-    # =========================================================
-    # BUILD PRESET
-    # =========================================================
-
-    def build_current_preset(self):
-
-        preset_id = (
-            self.preset_combo
-            .currentData()
-        )
-
-        preset = deepcopy(
-            get_preset(
-                preset_id
-            )
-        )
-
-        resolution = (
-            self.resolution_combo
-            .currentData()
-        )
-
-        if resolution:
-
-            preset.max_dimension = int(
-                resolution
-            )
-
-        preset.codec = (
-            self.codec_combo
-            .currentData()
-            or "h264"
-        )
-
-        preset.cq = int(
-            self.cq_spin.value()
-        )
-
-        fps_text = (
-            self.fps_combo
-            .currentText()
-        )
-
-        if fps_text == "Original":
-
-            preset.fps = "original"
-
-        else:
-
-            preset.fps = fps_text
-
-        preset.encoder_preset = (
-            self.encoder_combo
-            .currentText()
-        )
-
-        preset.audio_mode = (
-            self.audio_combo
-            .currentData()
-            or "aac"
-        )
-
-        preset.audio_bitrate = (
-            self.audio_bitrate_combo
-            .currentText()
-        )
-
-        preset.audio_channels = (
-            self.audio_channels_combo
-            .currentData()
-            or 2
-        )
-
-        preset.audio_rate = (
-            self.audio_sample_rate
-        )
-
-        preset.copy_metadata = (
-            self.metadata_check.isChecked()
-        )
-
-        preset.faststart = (
-            self.faststart_check.isChecked()
-        )
-
-        return preset
+    @staticmethod
+    def _set_combo_data(combo, value):
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
 
     # =========================================================
     # ADD VIDEOS
@@ -3273,10 +3489,9 @@ class MainWindow(QMainWindow):
             "",
 
             (
-                "Video Files "
-                "(*.mp4 *.mov *.mkv *.avi "
-                "*.webm *.m4v *.ts *.mts *.m2ts);;"
-                "All Files (*)"
+                "Video Files ("
+                + " ".join(f"*{extension}" for extension in sorted(SUPPORTED_MEDIA_EXTENSIONS))
+                + ");;All Files (*)"
             ),
         )
 
@@ -3307,40 +3522,25 @@ class MainWindow(QMainWindow):
         if not folder:
             return
 
-        extensions = {
-            ".mp4",
-            ".mov",
-            ".mkv",
-            ".avi",
-            ".webm",
-            ".m4v",
-            ".ts",
-            ".mts",
-            ".m2ts",
-        }
-
         folder_path = Path(
             folder
-        )
-
-        files = [
-            path
-            for path in folder_path.iterdir()
-            if path.is_file()
-            and path.suffix.lower()
-            in extensions
-        ]
-
-        for file_path in sorted(
-            files
-        ):
-
-            self.add_queue_item(
-                file_path
+        ).resolve()
+        output_directory = Path(self.output_edit.text()).expanduser()
+        if not output_directory.is_absolute():
+            output_directory = self.settings_manager.root_dir / output_directory
+        try:
+            files = discover_media_files(
+                folder_path,
+                recursive=self.recursive_check.isChecked(),
+                excluded_directories=(output_directory,),
             )
-
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Folder Scan Failed", str(error))
+            return
+        for file_path in files:
+            self.add_queue_item(file_path, source_root=folder_path)
         self.input_edit.setText(
-            f"{len(self.queue_items)} video(s) in queue"
+            f"{len(files)} discovered · {len(self.queue_items)} total in queue"
         )
 
     # =========================================================
@@ -3349,7 +3549,8 @@ class MainWindow(QMainWindow):
 
     def add_queue_item(
         self,
-        file_path
+        file_path,
+        source_root=None,
     ):
 
         file_path = Path(
@@ -3372,10 +3573,14 @@ class MainWindow(QMainWindow):
 
             self.remove_queue_item
         )
+        item.preset_id = self.preset_combo.currentData()
 
         self.queue_items.append(
             item
         )
+        item.source_root = source_root
+        if self._queue_encoding_options is not None:
+            item.encoding_options = self._queue_encoding_options
 
         self.queue_container_layout.insertWidget(
             self.queue_container_layout.count() - 1,
@@ -3440,50 +3645,8 @@ class MainWindow(QMainWindow):
 
         for item in self.queue_items:
             if item.input_file == input_file:
-                video = MediaInfo.video_stream(
-                    info
-                )
-
-                try:
-                    fps = float(
-                        Fraction(
-                            str(
-                                video.get(
-                                    "r_frame_rate",
-                                    "0/1"
-                                )
-                            )
-                        )
-                    )
-                except (ValueError, ZeroDivisionError):
-                    fps = 0.0
-
-                format_info = info.get(
-                    "format",
-                    {}
-                )
-
-                try:
-                    size = int(
-                        format_info.get(
-                            "size",
-                            item.input_file.stat().st_size,
-                        )
-                    )
-                except (OSError, TypeError, ValueError):
-                    size = 0
-
-                item.set_media_info({
-                    "width": video.get("width", 0),
-                    "height": video.get("height", 0),
-                    "fps": fps,
-                    "video_codec": video.get(
-                        "codec_name",
-                        "Unknown"
-                    ),
-                    "size": size,
-                    "duration": MediaInfo.duration(info),
-                })
+                item.set_media_info(info)
+                self.refresh_output_preview()
                 break
 
     # =========================================================
@@ -3622,6 +3785,53 @@ class MainWindow(QMainWindow):
 
             return
 
+        try:
+            self._queue_encoding_options = self.build_current_options()
+            self._persist_encoding_options()
+            output_text = self.output_edit.text().strip()
+            self._batch_output_root = (
+                Path(output_text).expanduser()
+                if output_text
+                else self.settings_manager.root_dir / "Compressed"
+            )
+            if not self._batch_output_root.is_absolute():
+                self._batch_output_root = (
+                    self.settings_manager.root_dir / self._batch_output_root
+                )
+            self._reserved_outputs.clear()
+            for item in self.queue_items:
+                if item.finished:
+                    continue
+                item.encoding_options = self._queue_encoding_options
+                relative_directory = relative_output_directory(
+                    item.source_root,
+                    item.input_file,
+                )
+                item.output_file_path = unique_output_path(
+                    self._batch_output_root / relative_directory,
+                    item.input_file,
+                    container=self._queue_encoding_options.container,
+                    reserved_paths=self._reserved_outputs,
+                )
+                item.preset_id = self.preset_combo.currentData()
+                item.batch_snapshot = BatchJobSnapshot(
+                    input_path=item.input_file,
+                    output_path=item.output_file_path,
+                    options=self._queue_encoding_options,
+                    preset_id=item.preset_id,
+                )
+                item.job_state = "Pending"
+                item.error_detail = ""
+                item.set_status("Pending")
+                item.status_label.setToolTip("")
+        except (OSError, ValueError, TypeError) as error:
+            QMessageBox.warning(
+                self,
+                "Could Not Prepare Batch",
+                str(error),
+            )
+            return
+
         self.log_edit.clear()
 
         self.start_button.setEnabled(
@@ -3631,6 +3841,14 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(
             True
         )
+        self.input_button.setEnabled(False)
+        self.add_folder_button.setEnabled(False)
+        self.recursive_check.setEnabled(False)
+        self.clear_queue_button.setEnabled(False)
+        for item in self.queue_items:
+            item.remove_button.setEnabled(False)
+        self.batch_progress_bar.setValue(0)
+        self.update_batch_status()
 
         self.current_queue_index = 0
         self.queue_succeeded = False
@@ -3672,6 +3890,7 @@ class MainWindow(QMainWindow):
         ):
 
             self.current_worker = None
+            self._queue_encoding_options = None
 
             self.start_button.setEnabled(
                 True
@@ -3680,9 +3899,16 @@ class MainWindow(QMainWindow):
             self.cancel_button.setEnabled(
                 False
             )
+            self.input_button.setEnabled(True)
+            self.add_folder_button.setEnabled(True)
+            self.recursive_check.setEnabled(True)
+            self.clear_queue_button.setEnabled(True)
+            for queued_item in self.queue_items:
+                queued_item.remove_button.setEnabled(True)
+            self.update_batch_status()
 
             self.log_edit.append(
-                "\n[QUEUE] All compression jobs completed."
+                "\n[QUEUE] Batch processing finished."
             )
 
             if (
@@ -3709,22 +3935,13 @@ class MainWindow(QMainWindow):
             self.current_queue_index
         ]
 
-        output_text = (
-            self.output_edit.text().strip()
-        )
-
-        output_dir = (
-            Path(output_text).expanduser()
-            if output_text
-            else self.settings_manager.root_dir
-            / "Compressed"
-        )
-
-        if not output_dir.is_absolute():
-            output_dir = (
-                self.settings_manager.root_dir
-                / output_dir
+        output_file = item.output_file_path
+        if output_file is None:
+            self._fail_current_queue_item(
+                "Batch item is missing its captured output path."
             )
+            return
+        output_dir = output_file.parent
 
         try:
             output_dir.mkdir(
@@ -3738,9 +3955,6 @@ class MainWindow(QMainWindow):
                 )
 
         except (OSError, ValueError) as error:
-            self.append_log(
-                f"[ERROR] Could not prepare output folder: {error}"
-            )
             QMessageBox.critical(
                 self,
                 "Invalid Output Folder",
@@ -3748,41 +3962,42 @@ class MainWindow(QMainWindow):
                 "output folder.\n\n"
                 f"{output_dir}\n\n{error}",
             )
-            self.current_queue_index = -1
-            self.start_button.setEnabled(True)
-            self.cancel_button.setEnabled(False)
+            self._fail_current_queue_item(
+                f"Could not prepare output folder {output_dir}: {error}"
+            )
             return
 
-        output_file = self.get_output_file(
-            output_dir,
-            item.input_file,
-        )
-
-        preset = (
-            self.build_current_preset()
-        )
+        preset = item.encoding_options
+        if preset is None:
+            self._fail_current_queue_item(
+                "Queue item is missing its captured encoding intent."
+            )
+            return
+        snapshot = getattr(item, "batch_snapshot", None)
+        if snapshot is None:
+            self._fail_current_queue_item(
+                "Batch item has no immutable job snapshot."
+            )
+            return
 
         worker = CompressionWorker(
 
-            input_file=item.input_file,
+            input_file=snapshot.input_path,
 
-            output_file=output_file,
+            output_file=snapshot.output_path,
 
-            preset=preset,
+            preset=snapshot.options,
 
-            use_gpu=(
-                self.gpu_check.isChecked()
-            ),
+            use_gpu=preset.prefer_gpu,
 
-            allow_cpu_fallback=(
-                self.fallback_check.isChecked()
-            ),
+            allow_cpu_fallback=preset.allow_cpu_fallback,
 
             overwrite_existing=(
                 self.overwrite_existing
             ),
 
             hardware=self.hardware,
+            media_analysis=item.media_analysis,
         )
 
         self.current_worker = worker
@@ -3811,11 +4026,122 @@ class MainWindow(QMainWindow):
             self.worker_thread_finished
         )
 
+        item.job_state = "Analyzing"
         item.status_label.setText(
-            "Starting..."
+            f"Analyzing · {self.current_queue_index + 1}/{len(self.queue_items)}"
         )
+        worker.stats_changed.connect(
+            lambda stats, queue_item=item, job_index=self.current_queue_index:
+                self.update_batch_progress(queue_item, job_index, stats)
+        )
+        worker.status_changed.connect(
+            lambda status, queue_item=item:
+                self.set_queue_item_encoding_status(queue_item, status)
+        )
+        self.update_batch_status()
 
         worker.start()
+
+    def set_queue_item_encoding_status(self, item, status):
+        if item.job_state in ("Completed", "Failed", "Cancelled"):
+            return
+        if str(status).lower().startswith("analy"):
+            item.job_state = "Analyzing"
+            item.set_status("Analyzing")
+        else:
+            item.job_state = "Encoding"
+            item.set_status(f"Encoding · {status}")
+        self.update_batch_status()
+
+    def update_batch_progress(self, current_item, job_index, stats):
+        progress = int(stats.get("progress", 0) or 0)
+        current_item.set_progress(progress)
+        durations = [
+            item.media_analysis.duration
+            if item.media_analysis and item.media_analysis.duration
+            else None
+            for item in self.queue_items
+        ]
+        weighted = all(duration is not None for duration in durations)
+        weights = durations if weighted else [1.0] * len(self.queue_items)
+        total_weight = sum(weights)
+        completed_weight = sum(
+            weight
+            for index, (item, weight) in enumerate(zip(self.queue_items, weights))
+            if index < job_index or item.job_state in ("Completed", "Failed")
+        )
+        overall = int(
+            100 * (completed_weight + weights[job_index] * progress / 100)
+            / total_weight
+        ) if total_weight else 0
+        self.batch_progress_bar.setValue(max(0, min(100, overall)))
+        mode = "duration-weighted" if weighted else "approximate"
+        self.batch_status_label.setText(
+            f"Processing {job_index + 1} / {len(self.queue_items)} · "
+            f"{current_item.input_file.name} · {progress}% "
+            f"(overall {mode}: {overall}%)"
+        )
+
+    def update_batch_status(self):
+        counts = {
+            state: sum(item.job_state == state for item in self.queue_items)
+            for state in (
+                "Completed", "Failed", "Cancelled", "Pending",
+                "Analyzing", "Encoding",
+            )
+        }
+        self.batch_status_label.setText(
+            f"Completed: {counts['Completed']}  ·  "
+            f"Failed: {counts['Failed']}  ·  "
+            f"Cancelled: {counts['Cancelled']}  ·  "
+            f"Pending: {counts['Pending']}  ·  "
+            f"Active: {counts['Analyzing'] + counts['Encoding']}"
+        )
+
+    def _persist_encoding_options(self):
+        settings = self.settings_manager.settings
+        video = settings.setdefault("video", {})
+        selected_choice = self.codec_choices_by_key[self.codec_combo.currentData()]
+        video.update({
+            "codec_choice": self.codec_combo.currentData(),
+            "codec": selected_choice.codec.value,
+            "resolution_mode": self.resolution_combo.currentData(),
+            "max_resolution": {
+                ResolutionMode.P720.value: "1280",
+                ResolutionMode.P1080.value: "1920",
+                ResolutionMode.P1440.value: "2560",
+                ResolutionMode.P2160.value: "3840",
+            }.get(self.resolution_combo.currentData(), "source"),
+            "custom_width": self.custom_width_spin.value(),
+            "custom_height": self.custom_height_spin.value(),
+            "fps_mode": self.fps_combo.currentData(),
+            "custom_fps": self.custom_fps_spin.value(),
+            "rate_control": self.rate_control_combo.currentData(),
+            "cq": self.cq_spin.value(),
+            "bitrate_kbps": self.bitrate_spin.value(),
+            "nvenc_preset": self.encoder_combo.currentData(),
+            "gop_size": self.gop_spin.value(),
+            "hdr_mode": self.hdr_combo.currentData(),
+            "hardware_mode": self.hardware_combo.currentData(),
+            "container": self.container_combo.currentData(),
+            "preserve_aspect_ratio": self.aspect_ratio_check.isChecked(),
+            "allow_upscale": self.allow_upscale_check.isChecked(),
+        })
+        audio = settings.setdefault("audio", {})
+        audio.update({
+            "mode": self.audio_combo.currentData(),
+            "bitrate": self.audio_bitrate_combo.currentData(),
+            "sample_rate": self.audio_sample_rate_combo.currentData(),
+            "channels": self.audio_channels_combo.currentData(),
+        })
+        processing = settings.setdefault("processing", {})
+        processing.update({
+            "gpu_acceleration": self.hardware_combo.currentData() != "cpu",
+            "cpu_fallback": self.fallback_check.isChecked(),
+            "faststart": self.faststart_check.isChecked(),
+            "copy_metadata": self.metadata_check.isChecked(),
+        })
+        self.settings_manager.save(settings)
 
     def get_output_file(
         self,
@@ -3870,9 +4196,12 @@ class MainWindow(QMainWindow):
         )
 
         self.queue_succeeded = True
+        item = self.queue_items[self.current_queue_index]
+        item.job_state = "Completed"
         self.last_output_dir = Path(
             output_file
         ).parent
+        self.update_batch_status()
 
         self.current_queue_index += 1
 
@@ -3889,18 +4218,19 @@ class MainWindow(QMainWindow):
         self,
         message
     ):
+        self._fail_current_queue_item(str(message))
 
-        self.append_log(
-            ""
-        )
-
-        self.append_log(
-            "[QUEUE] Job failed:"
-        )
-
-        self.append_log(
-            str(message)
-        )
+    def _fail_current_queue_item(self, message):
+        self.append_log("")
+        self.append_log("[QUEUE] Job failed:")
+        self.append_log(str(message))
+        if 0 <= self.current_queue_index < len(self.queue_items):
+            item = self.queue_items[self.current_queue_index]
+            item.job_state = "Failed"
+            item.error_detail = str(message)
+            item.set_status("Failed")
+            item.status_label.setToolTip(str(message))
+        self.update_batch_status()
 
         self.current_queue_index += 1
 
@@ -3920,11 +4250,14 @@ class MainWindow(QMainWindow):
             ]
             item.set_status("Cancelled")
             item.set_progress(0)
+            item.job_state = "Cancelled"
+            item.error_detail = "Cancelled by user."
 
         self.append_log(
             "[QUEUE] Current job cancelled. "
             "The remaining queue is paused."
         )
+        self.update_batch_status()
 
     # =========================================================
     # WORKER FINISHED
@@ -3949,6 +4282,14 @@ class MainWindow(QMainWindow):
                 self.current_queue_index = -1
                 self.start_button.setEnabled(True)
                 self.cancel_button.setEnabled(False)
+                self.input_button.setEnabled(True)
+                self.add_folder_button.setEnabled(True)
+                self.recursive_check.setEnabled(True)
+                self.clear_queue_button.setEnabled(True)
+                for queued_item in self.queue_items:
+                    queued_item.remove_button.setEnabled(True)
+                self._queue_encoding_options = None
+                self.update_batch_status()
 
     # =========================================================
     # CANCEL

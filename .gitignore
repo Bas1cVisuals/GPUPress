@@ -9,7 +9,7 @@ env/
 
 build/
 dist/
-*.spec
+GPUPress.spec
 GPUPress.exe
 bin/ffmpeg.exe
 bin/ffprobe.exe
@@ -33,6 +33,10 @@ config/*.tmp
 *.tmp
 *.partial
 *.partial.mp4
+*.log
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 
 Thumbs.db
 .DS_Store

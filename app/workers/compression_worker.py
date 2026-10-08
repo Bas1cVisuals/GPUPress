@@ -1,13 +1,26 @@
 from pathlib import Path
-import json
 import re
-import subprocess
 import uuid
 
 from PySide6.QtCore import QThread, Signal
 
-from app.core.ffmpeg import FFmpegEngine
+from app.core.encoding_plan import (
+    EncodingPlan,
+    EncodingStrategyError,
+    HardwareCapabilities,
+    HDRMode,
+    UserEncodingOptions,
+    create_encoding_plan,
+    resolve_encoding_pipelines,
+)
+from app.core.ffmpeg import (
+    CommandGenerationError,
+    EncodingPipeline,
+    FFmpegEngine,
+)
 from app.core.hardware import HardwareInfo
+from app.core.media import MediaAnalysis, MediaInfo
+from app.core.presets import CompressionPreset
 
 
 class CompressionWorker(QThread):
@@ -39,17 +52,15 @@ class CompressionWorker(QThread):
         allow_cpu_fallback=True,
         overwrite_existing=False,
         hardware=None,
+        media_analysis=None,
         parent=None,
     ):
         super().__init__(parent)
 
         self.input_file = Path(input_file)
         self.output_file = Path(output_file)
-        self.working_output_file = (
-            self.output_file.with_name(
-                f".gpupress-{uuid.uuid4().hex}.partial"
-                f"{self.output_file.suffix}"
-            )
+        self.working_output_file = self._make_working_output_path(
+            self.output_file
         )
 
         self.preset = preset
@@ -94,12 +105,74 @@ class CompressionWorker(QThread):
 
         self.duration_seconds = 0.0
         self.input_size_bytes = 0
+        self.media_analysis: MediaAnalysis | None = media_analysis
+        self.encoding_plan: EncodingPlan | None = (
+            preset if isinstance(preset, EncodingPlan) else None
+        )
+        self.hardware_capabilities = (
+            self.hardware.get_capabilities()
+            if hasattr(self.hardware, "get_capabilities")
+            else None
+        )
+        self._last_pipeline_error = ""
+        self._output_validation_error = ""
+        self.output_analysis: MediaAnalysis | None = None
 
         self.current_seconds = 0.0
         self.current_frame = 0
         self.current_fps = 0.0
         self.current_speed = 0.0
         self.current_bitrate = ""
+
+    @staticmethod
+    def _make_working_output_path(output_file):
+        output_file = Path(output_file)
+        return output_file.with_name(
+            f".gpupress-{uuid.uuid4().hex}.partial{output_file.suffix}"
+        )
+
+    def _set_output_container(self, plan):
+        """Match target suffix to the resolved preset container."""
+        suffix = f".{plan.container.lower().lstrip('.')}"
+        if self.output_file.suffix.lower() != suffix:
+            self.output_file = self.output_file.with_suffix(suffix)
+            if not self.overwrite_existing:
+                base = self.output_file
+                index = 1
+                while self.output_file.exists():
+                    self.output_file = base.with_name(
+                        f"{base.stem}_{index}{base.suffix}"
+                    )
+                    index += 1
+            self.working_output_file = self._make_working_output_path(
+                self.output_file
+            )
+
+    def _resolve_plan(self) -> EncodingPlan:
+        if isinstance(self.preset, EncodingPlan):
+            return self.preset
+        media_analysis = self.media_analysis
+        if media_analysis is None:
+            raise ValueError(
+                "Cannot create an encoding plan without successful media analysis."
+            )
+        if isinstance(self.preset, UserEncodingOptions):
+            return create_encoding_plan(
+                media_analysis,
+                self.preset,
+                self.hardware_capabilities or HardwareCapabilities(),
+            )
+        if not isinstance(self.preset, CompressionPreset):
+            raise ValueError("The selected preset does not provide encoding intent.")
+        options = self.preset.to_legacy_worker_options(
+            use_gpu=self.use_gpu,
+            allow_cpu_fallback=self.allow_cpu_fallback,
+        )
+        return create_encoding_plan(
+            media_analysis,
+            options,
+            self.hardware_capabilities or HardwareCapabilities(),
+        )
 
     # =========================================================
     # CANCEL
@@ -163,24 +236,224 @@ class CompressionWorker(QThread):
 
     def validate_output(self):
 
-        if not self.working_output_file.exists():
+        self._output_validation_error = (
+            "Output validation failed: output file is missing or empty."
+        )
+        plan = self.encoding_plan
+        if plan is None:
+            self._output_validation_error = (
+                "Output validation failed: encoding plan is unavailable."
+            )
+            return False
+        if not self.working_output_file.is_file():
             return False
 
         try:
-
             size = (
                 self.working_output_file
                 .stat()
                 .st_size
             )
 
-            if size < 1024:
+            if size <= 0:
                 return False
 
-        except Exception:
-
+            ffprobe_path = (
+                Path(self.hardware.ffmpeg_path).parent
+                / "ffprobe.exe"
+            )
+            analyzed = MediaInfo(ffprobe_path).probe(
+                self.working_output_file
+            )
+            if not analyzed or analyzed.video is None:
+                self._output_validation_error = (
+                    "FFprobe could not find a valid video stream in the output."
+                )
+                return False
+            if (
+                analyzed.video.width is None
+                or analyzed.video.height is None
+            ):
+                self._output_validation_error = (
+                    "FFprobe output is missing valid video dimensions."
+                )
+                return False
+            if (
+                analyzed.video.width != plan.output_width
+                or analyzed.video.height != plan.output_height
+            ):
+                self._output_validation_error = (
+                    "Output dimensions do not match the resolved plan: "
+                    f"expected {plan.output_width}x{plan.output_height}, got "
+                    f"{analyzed.video.width}x{analyzed.video.height}."
+                )
+                return False
+            supported_container_formats = {
+                "mp4": {"mp4", "mov"},
+                "m4v": {"mp4", "mov"},
+                "mov": {"mp4", "mov"},
+                "mkv": {"matroska"},
+            }
+            expected_formats = supported_container_formats.get(
+                plan.container.lower().lstrip(".")
+            )
+            if expected_formats is None:
+                self._output_validation_error = (
+                    "Output container is not supported for validation: "
+                    f"{plan.container}."
+                )
+                return False
+            if analyzed.format_name:
+                actual_formats = {
+                    value.strip().lower()
+                    for value in analyzed.format_name.split(",")
+                }
+                if not actual_formats.intersection(expected_formats):
+                    self._output_validation_error = (
+                        "Output container does not match the resolved plan: "
+                        f"expected {plan.container}, got "
+                        f"{analyzed.format_name}."
+                    )
+                    return False
+            expected_video_codec = {
+                "h264": "h264",
+                "hevc": "hevc",
+                "av1": "av1",
+                "prores_proxy": "prores",
+                "prores_lt": "prores",
+                "prores_422": "prores",
+                "dnxhr_lb": "dnxhd",
+                "dnxhr_sq": "dnxhd",
+                "dnxhr_hq": "dnxhd",
+            }.get(plan.codec.value)
+            if (
+                expected_video_codec
+                and analyzed.video.codec_name != expected_video_codec
+            ):
+                self._output_validation_error = (
+                    "Output video codec does not match the resolved plan: "
+                    f"expected {expected_video_codec}, got "
+                    f"{analyzed.video.codec_name}."
+                )
+                return False
+            if self.media_analysis and self.media_analysis.audio:
+                if not analyzed.audio:
+                    self._output_validation_error = (
+                        "The source contains audio, but the output has no audio stream."
+                    )
+                    return False
+                if plan.audio_mode.value == "copy":
+                    source_audio_codec = self.media_analysis.audio.codec_name
+                    if (
+                        source_audio_codec
+                        and analyzed.audio.codec_name != source_audio_codec
+                    ):
+                        self._output_validation_error = (
+                            "Audio copy was requested, but output audio codec "
+                            f"changed from {source_audio_codec} to "
+                            f"{analyzed.audio.codec_name}."
+                        )
+                        return False
+                elif plan.audio_mode.value == "aac":
+                    if analyzed.audio.codec_name != "aac":
+                        self._output_validation_error = (
+                            "AAC audio was requested, but FFprobe found "
+                            f"{analyzed.audio.codec_name}."
+                        )
+                        return False
+                    if (
+                        plan.sample_rate
+                        and analyzed.audio.sample_rate != plan.sample_rate
+                    ):
+                        self._output_validation_error = (
+                            "Output audio sample rate does not match the plan."
+                        )
+                        return False
+                    if (
+                        plan.channel_count
+                        and analyzed.audio.channels != plan.channel_count
+                    ):
+                        self._output_validation_error = (
+                            "Output audio channel count does not match the plan."
+                        )
+                        return False
+            if plan.resolved_fps and analyzed.video.frame_rate:
+                if abs(analyzed.video.frame_rate - plan.resolved_fps) > 0.1:
+                    self._output_validation_error = (
+                        "Output frame rate does not match the resolved plan: "
+                        f"expected {plan.resolved_fps:.3f}, got "
+                        f"{analyzed.video.frame_rate:.3f}."
+                    )
+                    return False
+            if (
+                self.media_analysis
+                and self.media_analysis.video
+                and self.media_analysis.duration
+                and analyzed.duration
+            ):
+                tolerance = max(2.0, self.media_analysis.duration * 0.05)
+                if abs(analyzed.duration - self.media_analysis.duration) > tolerance:
+                    self._output_validation_error = (
+                        "Output duration differs significantly from source "
+                        f"({analyzed.duration:.2f}s vs "
+                        f"{self.media_analysis.duration:.2f}s)."
+                    )
+                    return False
+            if not self._validate_hdr_output(analyzed):
+                return False
+            self.output_analysis = analyzed
+        except (OSError, ValueError, TypeError) as error:
+            self._output_validation_error = f"FFprobe validation failed: {error}"
             return False
 
+        self._output_validation_error = ""
+        return True
+
+    def _validate_hdr_output(self, analyzed):
+        plan = self.encoding_plan
+        if (
+            plan is None
+            or plan.hdr_mode is not HDRMode.PRESERVE
+            or plan.source_hdr_classification.value
+            not in {"hlg", "pq", "hdr_unknown"}
+        ):
+            return True
+        output = analyzed.video
+        if output.bit_depth is None or output.bit_depth < 10:
+            self._output_validation_error = (
+                "HDR preservation failed: output is not at least 10-bit."
+            )
+            return False
+        for name, expected, actual in (
+            ("color primaries", plan.source_color_primaries, output.color_primaries),
+            ("transfer", plan.source_color_transfer, output.color_transfer),
+            ("colorspace", plan.source_color_space, output.color_space),
+        ):
+            if expected and actual and expected.lower() != actual.lower():
+                self._output_validation_error = (
+                    f"HDR preservation failed: {name} changed from "
+                    f"{expected} to {actual}."
+                )
+                return False
+        if plan.source_hdr_classification.value in {"hlg", "pq"}:
+            if output.hdr_classification.value != plan.source_hdr_classification.value:
+                self._output_validation_error = (
+                    "HDR preservation failed: output HDR transfer classification "
+                    "does not match the source."
+                )
+                return False
+        output_side_data = {
+            value.lower() for value in output.hdr_metadata_types
+        }
+        missing_side_data = {
+            value.lower() for value in plan.source_hdr_metadata_types
+        } - output_side_data
+        if missing_side_data:
+            self._output_validation_error = (
+                "HDR preservation failed: FFprobe no longer reports source HDR "
+                "metadata: " + ", ".join(sorted(missing_side_data))
+            )
+            return False
         return True
 
     # =========================================================
@@ -577,148 +850,40 @@ class CompressionWorker(QThread):
     # =========================================================
 
     def read_input_metadata(self):
-
+        """Probe full input media once; retain the old method name."""
         self.duration_seconds = 0.0
         self.input_size_bytes = 0
-
-        # -----------------------------------------------------
-        # FILE SIZE
-        # -----------------------------------------------------
-
         try:
-
-            if self.input_file.exists():
-
-                self.input_size_bytes = (
+            source_size = self.input_file.stat().st_size
+            if (
+                self.media_analysis is None
+                or not self.media_analysis
+                or (
+                    self.media_analysis.size is not None
+                    and self.media_analysis.size != source_size
+                )
+            ):
+                ffprobe_path = (
+                    Path(self.hardware.ffmpeg_path).parent / "ffprobe.exe"
+                )
+                self.media_analysis = MediaInfo(ffprobe_path).probe(
                     self.input_file
-                    .stat()
-                    .st_size
                 )
-
-        except Exception:
-
-            self.input_size_bytes = 0
-
-        # -----------------------------------------------------
-        # FFPROBE
-        # -----------------------------------------------------
-
-        try:
-
-            ffprobe_path = (
-                Path(
-                    self.hardware.ffmpeg_path
-                ).parent
-                / "ffprobe.exe"
-            )
-
-            if not ffprobe_path.exists():
-
-                self.log_message.emit(
-                    "[WARNING] ffprobe.exe not found:\n"
-                    f"{ffprobe_path}"
+            if not self.media_analysis:
+                raise ValueError(
+                    f"FFprobe could not analyze input media: {self.input_file}"
                 )
-
-                return
-
-            probe_command = [
-
-                str(ffprobe_path),
-
-                "-v",
-                "error",
-
-                "-show_entries",
-                "format=duration,size",
-
-                "-of",
-                "json",
-
-                str(self.input_file),
-            ]
-
-            creation_flags = getattr(
-                subprocess,
-                "CREATE_NO_WINDOW",
-                0,
+            self.duration_seconds = self.media_analysis.duration or 0.0
+            self.input_size_bytes = (
+                self.media_analysis.size
+                or source_size
             )
-
-            result = subprocess.run(
-
-                probe_command,
-
-                stdout=subprocess.PIPE,
-
-                stderr=subprocess.PIPE,
-
-                text=True,
-
-                encoding="utf-8",
-
-                errors="replace",
-
-                creationflags=creation_flags,
-            )
-
-            if result.returncode != 0:
-                return
-
-            data = json.loads(
-                result.stdout
-            )
-
-            format_data = data.get(
-                "format",
-                {}
-            )
-
-            # -------------------------------------------------
-            # DURATION
-            # -------------------------------------------------
-
-            try:
-
-                self.duration_seconds = float(
-                    format_data.get(
-                        "duration",
-                        0,
-                    )
-                )
-
-            except Exception:
-
-                self.duration_seconds = 0.0
-
-            # -------------------------------------------------
-            # FILE SIZE
-            # -------------------------------------------------
-
-            try:
-
-                probed_size = int(
-                    float(
-                        format_data.get(
-                            "size",
-                            0,
-                        )
-                    )
-                )
-
-                if probed_size > 0:
-
-                    self.input_size_bytes = (
-                        probed_size
-                    )
-
-            except Exception:
-                pass
-
-        except Exception as error:
-
+            return self.media_analysis
+        except (OSError, ValueError, TypeError) as error:
             self.log_message.emit(
-                "[WARNING] Could not read "
-                f"media metadata: {error}"
+                f"[ERROR] Could not analyze input media: {error}"
             )
+            raise
 
     # =========================================================
     # FINAL STATS
@@ -911,6 +1076,8 @@ class CompressionWorker(QThread):
                 "[ERROR] FFmpeg process error: "
                 f"{error}"
             )
+            self._last_pipeline_error = str(error)
+            self.cleanup_output()
 
             return False
 
@@ -924,10 +1091,7 @@ class CompressionWorker(QThread):
 
             return False
 
-        if (
-            return_code == 0
-            and self.validate_output()
-        ):
+        if return_code == 0 and self.validate_output():
 
             try:
                 if self.overwrite_existing:
@@ -963,11 +1127,25 @@ class CompressionWorker(QThread):
 
             return True
 
+        if return_code == 0:
+            self._last_pipeline_error = (
+                self._output_validation_error
+                or "FFmpeg exited successfully but the output failed validation."
+            )
+            self.log_message.emit(
+                f"[ERROR] {self._last_pipeline_error}"
+            )
+            self.cleanup_output()
+            return False
+
         self.log_message.emit("")
 
         self.log_message.emit(
             "[ERROR] FFmpeg exited with "
             f"code {return_code}."
+        )
+        self._last_pipeline_error = (
+            f"FFmpeg exited with code {return_code}."
         )
 
         self.cleanup_output()
@@ -988,9 +1166,7 @@ class CompressionWorker(QThread):
 
         self.progress_changed.emit(0)
 
-        self.status_changed.emit(
-            "Preparing..."
-        )
+        self.status_changed.emit("Analyzing...")
 
         if self.cancel_requested:
             self.compression_cancelled.emit()
@@ -1009,269 +1185,94 @@ class CompressionWorker(QThread):
 
             return
 
-        # -----------------------------------------------------
-        # OUTPUT SAFETY
-        # -----------------------------------------------------
-
         try:
+            self.read_input_metadata()
+            plan = self._resolve_plan()
+            self.encoding_plan = plan
+            self._set_output_container(plan)
 
-            if (
-                self.input_file.resolve()
-                == self.output_file.resolve()
-            ):
-                self.compression_failed.emit(
-                    "Output file must not be the input file."
+            if self.input_file.resolve() == self.output_file.resolve():
+                raise ValueError("Output file must not be the input file.")
+            if self.output_file.exists() and not self.overwrite_existing:
+                raise FileExistsError(
+                    f"Output file already exists:\n{self.output_file}"
                 )
-                return
 
-            if self.output_file.exists():
-
-                if not self.overwrite_existing:
-                    self.compression_failed.emit(
-                        "Output file already exists:\n"
-                        f"{self.output_file}"
-                    )
-                    return
-
+            self.output_file.parent.mkdir(parents=True, exist_ok=True)
             self._output_may_be_removed = True
-
-        except (OSError, RuntimeError, ValueError) as error:
-
-            self.compression_failed.emit(
-                "Could not prepare output file:\n"
-                f"{error}"
-            )
+            duration_seconds = self.duration_seconds
+            self.stats_changed.emit({
+                "frame": 0,
+                "fps": 0.0,
+                "speed": 0.0,
+                "time": 0.0,
+                "duration": duration_seconds,
+                "eta": duration_seconds,
+                "progress": 0,
+                "bitrate": "",
+                "input_size": self.input_size_bytes,
+                "output_size": 0,
+                "saved_bytes": 0,
+                "reduction_percent": 0.0,
+            })
+        except (OSError, RuntimeError, ValueError, TypeError) as error:
+            self.cleanup_output()
+            self.compression_failed.emit(str(error))
             return
 
-        # -----------------------------------------------------
-        # OUTPUT FOLDER
-        # -----------------------------------------------------
-
+        capabilities = self.hardware_capabilities or HardwareCapabilities()
         try:
-
-            self.output_file.parent.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
-        except (OSError, ValueError) as error:
-
-            self.compression_failed.emit(
-                "Could not create output folder:\n"
-                f"{error}"
-            )
-
+            candidates = resolve_encoding_pipelines(plan, capabilities)
+        except EncodingStrategyError as error:
+            self.compression_failed.emit(str(error))
             return
 
-        # -----------------------------------------------------
-        # READ MEDIA INFO
-        # -----------------------------------------------------
-
-        self.read_input_metadata()
-
-        duration_seconds = (
-            self.duration_seconds
-        )
-
-        self.stats_changed.emit({
-
-            "frame": 0,
-
-            "fps": 0.0,
-
-            "speed": 0.0,
-
-            "time": 0.0,
-
-            "duration":
-                duration_seconds,
-
-            "eta":
-                duration_seconds,
-
-            "progress": 0,
-
-            "bitrate": "",
-
-            "input_size":
-                self.input_size_bytes,
-
-            "output_size": 0,
-
-            "saved_bytes": 0,
-
-            "reduction_percent": 0.0,
-        })
-
-        # =====================================================
-        # GPU MODE
-        # =====================================================
-
-        if self.use_gpu:
-
-            # -------------------------------------------------
-            # GPU: NVDEC + CUDA SCALE + NVENC
-            # -------------------------------------------------
-
-            gpu_command = (
-                self.ffmpeg
-                .build_gpu_command(
-                    self.input_file,
-                    self.working_output_file,
-                    self.preset,
-                    self.overwrite_existing,
-                )
-            )
-
-            gpu_success = (
-                self.run_pipeline(
-                    "GPU: NVDEC + CUDA SCALE + NVENC",
-                    gpu_command,
-                    duration_seconds,
-                )
-            )
-
-            if gpu_success:
-
-                self.compression_finished.emit(
-                    str(
-                        self.output_file
-                    )
-                )
-
-                return
-
+        for pipeline in candidates:
             if self.cancel_requested:
+                self.cleanup_output()
                 self.compression_cancelled.emit()
                 return
 
-            if not self.allow_cpu_fallback:
-
-                self.compression_failed.emit(
-                    "GPU compression failed and "
-                    "CPU fallback is disabled."
+            try:
+                command = self.ffmpeg.build_plan_command(
+                    self.input_file,
+                    self.working_output_file,
+                    plan,
+                    pipeline=pipeline,
+                    capabilities=capabilities,
+                    overwrite=self.overwrite_existing,
                 )
+            except CommandGenerationError as error:
+                self._last_pipeline_error = str(error)
+                self.log_message.emit(f"[ERROR] {error}")
+                continue
 
+            pipeline_label = {
+                EncodingPipeline.GPU: "GPU: NVDEC + CUDA SCALE + NVENC",
+                EncodingPipeline.NVENC: "CPU DECODE + NVENC",
+                EncodingPipeline.CPU: f"CPU: {plan.codec.value}",
+            }[pipeline]
+            if self.run_pipeline(
+                pipeline_label,
+                command,
+                self.duration_seconds,
+            ):
+                if self.cancel_requested:
+                    self.cleanup_output()
+                    self.compression_cancelled.emit()
+                    return
+                self.compression_finished.emit(str(self.output_file))
                 return
-
-            self.log_message.emit("")
-
-            self.log_message.emit(
-                "[FALLBACK] GPU pipeline failed."
-            )
-
-            self.log_message.emit(
-                "[FALLBACK] Trying CPU decode + NVENC..."
-            )
-
-            # -------------------------------------------------
-            # CPU DECODE + NVENC
-            # -------------------------------------------------
-
+            if self.cancel_requested:
+                self.cleanup_output()
+                self.compression_cancelled.emit()
+                return
             self.cleanup_output()
-
-            nvenc_command = (
-                self.ffmpeg
-                .build_nvenc_fallback_command(
-                    self.input_file,
-                    self.working_output_file,
-                    self.preset,
-                    self.overwrite_existing,
-                )
-            )
-
-            nvenc_success = (
-                self.run_pipeline(
-                    "FALLBACK: CPU DECODE + NVENC",
-                    nvenc_command,
-                    duration_seconds,
-                )
-            )
-
-            if nvenc_success:
-
-                self.compression_finished.emit(
-                    str(
-                        self.output_file
-                    )
-                )
-
-                return
-
-            if self.cancel_requested:
-                self.compression_cancelled.emit()
-                return
-
-            if not self.allow_cpu_fallback:
-
-                self.compression_failed.emit(
-                    "NVENC fallback failed."
-                )
-
-                return
-
-            self.log_message.emit("")
-
-            self.log_message.emit(
-                "[FALLBACK] NVENC pipeline failed."
-            )
-
-            self.log_message.emit(
-                "[FALLBACK] Trying CPU x264..."
-            )
-
-        # =====================================================
-        # CPU X264
-        # =====================================================
-
-        if (
-            not self.use_gpu
-            or self.allow_cpu_fallback
-        ):
-
-            self.cleanup_output()
-
-            cpu_command = (
-                self.ffmpeg
-                .build_cpu_command(
-                    self.input_file,
-                    self.working_output_file,
-                    self.preset,
-                    self.overwrite_existing,
-                )
-            )
-
-            cpu_success = (
-                self.run_pipeline(
-                    "CPU: x264"
-                    if not self.use_gpu
-                    else "FALLBACK: CPU DECODE + x264",
-                    cpu_command,
-                    duration_seconds,
-                )
-            )
-
-            if cpu_success:
-
-                self.compression_finished.emit(
-                    str(
-                        self.output_file
-                    )
-                )
-
-                return
-
-            if self.cancel_requested:
-                self.compression_cancelled.emit()
-                return
-
-        # =====================================================
-        # FINAL FAILURE
-        # =====================================================
 
         self.cleanup_output()
-
+        reason = self._last_pipeline_error or (
+            "All permitted encoding pipelines failed."
+        )
         self.compression_failed.emit(
-            "Compression failed on all available "
-            "encoding pipelines."
+            f"Encoding failed for {plan.codec.value}: {reason}"
         )

@@ -4,6 +4,7 @@ from pathlib import Path
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
+from app import __version__
 from app.ui.main_window import MainWindow
 
 
@@ -19,6 +20,7 @@ def main():
     # -----------------------------------------------------
 
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(__version__)
     app.setApplicationDisplayName(
         f"{APP_BRAND}"
     )

@@ -52,12 +52,26 @@ class SettingsManager:
             "codec": "h264",
             "cq": 18,
             "max_resolution": "1920",
-            "fps": "30",
+            "fps": "smart",
+            "fps_mode": "smart",
+            "custom_fps": 30.0,
+            "codec_choice": "h264_nvenc",
+            "resolution_mode": "1080p",
+            "custom_width": 1920,
+            "custom_height": 1080,
+            "rate_control": "cq",
+            "bitrate_kbps": 12000,
+            "gop_size": 0,
+            "hdr_mode": "auto",
+            "hardware_mode": "auto",
+            "container": "mp4",
+            "allow_upscale": False,
             "nvenc_preset": "p6",
             "preserve_aspect_ratio": True,
         },
         "audio": {
             "codec": "aac",
+            "mode": "auto",
             "bitrate": "192k",
             "sample_rate": 48000,
             "channels": "2",
@@ -200,6 +214,7 @@ class SettingsManager:
                 )
                 return defaults
 
+            saved = self._migrate_legacy_settings(saved)
             settings = self._deep_merge(
                 defaults,
                 saved,
@@ -222,6 +237,49 @@ class SettingsManager:
                 error,
             )
             return defaults
+
+    @staticmethod
+    def _migrate_legacy_settings(saved):
+        """Translate legacy values into new intent keys without mutating input."""
+        migrated = json.loads(json.dumps(saved))
+        if not isinstance(migrated.get("video"), dict):
+            migrated["video"] = {}
+        video = migrated["video"]
+        if "codec_choice" not in video:
+            codec = str(video.get("codec", "h264")).lower()
+            video["codec_choice"] = {
+                "hevc": "hevc_nvenc",
+                "h265": "hevc_nvenc",
+                "av1": "av1_nvenc",
+            }.get(codec, "h264_nvenc")
+        if "resolution_mode" not in video:
+            video["resolution_mode"] = {
+                "1280": "720p",
+                "1920": "1080p",
+                "2560": "1440p",
+                "3840": "2160p",
+            }.get(str(video.get("max_resolution", "1920")), "auto")
+        if "fps_mode" not in video:
+            # Older defaults forced 30 FPS; the corrected default is source-smart.
+            video["fps_mode"] = "smart"
+        if not isinstance(migrated.get("audio"), dict):
+            migrated["audio"] = {}
+        audio = migrated["audio"]
+        if "mode" not in audio:
+            legacy_audio = str(audio.get("codec", "auto")).lower()
+            audio["mode"] = (
+                "copy" if legacy_audio == "copy" else "auto"
+            )
+        processing = migrated.get("processing", {})
+        if not isinstance(processing, dict):
+            processing = {}
+        if "hardware_mode" not in video:
+            video["hardware_mode"] = (
+                "auto"
+                if processing.get("gpu_acceleration", True)
+                else "cpu"
+            )
+        return migrated
 
     def save(self, settings=None):
 
@@ -675,33 +733,11 @@ class SettingsDialog(QDialog):
 
         self.video_fps.addItem(
             "Original",
-            "original",
+            "smart",
         )
 
-        self.video_fps.addItem(
-            "24 FPS",
-            "24",
-        )
-
-        self.video_fps.addItem(
-            "25 FPS",
-            "25",
-        )
-
-        self.video_fps.addItem(
-            "30 FPS",
-            "30",
-        )
-
-        self.video_fps.addItem(
-            "50 FPS",
-            "50",
-        )
-
-        self.video_fps.addItem(
-            "60 FPS",
-            "60",
-        )
+        for rate in ("23.976", "24", "25", "29.97", "30", "50", "59.94", "60"):
+            self.video_fps.addItem(f"{rate} FPS", rate)
 
         video_layout.addRow(
             "Frame rate",
@@ -775,6 +811,11 @@ class SettingsDialog(QDialog):
         )
 
         self.audio_codec = QComboBox()
+
+        self.audio_codec.addItem(
+            "Auto (copy when compatible)",
+            "auto",
+        )
 
         self.audio_codec.addItem(
             "AAC",
@@ -1101,8 +1142,8 @@ class SettingsDialog(QDialog):
             self.video_fps,
             str(
                 video.get(
-                    "fps",
-                    "30",
+                    "fps_mode",
+                    video.get("fps", "smart"),
                 )
             ),
         )
@@ -1126,10 +1167,7 @@ class SettingsDialog(QDialog):
 
         self._set_combo_data(
             self.audio_codec,
-            audio.get(
-                "codec",
-                "aac",
-            ),
+            audio.get("mode", audio.get("codec", "auto")),
         )
 
         self._set_combo_data(
@@ -1217,7 +1255,16 @@ class SettingsDialog(QDialog):
 
     def _collect_settings(self):
 
-        self.settings = {
+        previous_settings = self.settings
+        codec = self.video_codec.currentData()
+        selected_resolution = str(self.video_resolution.currentData())
+        resolution_mode = {
+            "1280": "720p",
+            "1920": "1080p",
+            "2560": "1440p",
+            "3840": "2160p",
+        }.get(selected_resolution, "auto")
+        updated_settings = {
             "general": {
                 "output_folder":
                     self.output_folder_edit.text(),
@@ -1234,15 +1281,24 @@ class SettingsDialog(QDialog):
 
             "video": {
                 "codec":
-                    self.video_codec.currentData(),
+                    codec,
+
+                "codec_choice":
+                    "hevc_nvenc" if codec == "hevc" else "h264_nvenc",
 
                 "cq":
                     self.video_cq.value(),
 
                 "max_resolution":
-                    self.video_resolution.currentData(),
+                    selected_resolution,
+
+                "resolution_mode":
+                    resolution_mode,
 
                 "fps":
+                    self.video_fps.currentData(),
+
+                "fps_mode":
                     self.video_fps.currentData(),
 
                 "nvenc_preset":
@@ -1254,6 +1310,9 @@ class SettingsDialog(QDialog):
 
             "audio": {
                 "codec":
+                    self.audio_codec.currentData(),
+
+                "mode":
                     self.audio_codec.currentData(),
 
                 "bitrate":
@@ -1282,7 +1341,21 @@ class SettingsDialog(QDialog):
                     self.copy_metadata.isChecked(),
             },
         }
+        updated_settings["video"]["hardware_mode"] = (
+            "auto"
+            if self.gpu_acceleration.isChecked()
+            else "cpu"
+        )
 
+        for section, values in previous_settings.items():
+            if isinstance(values, dict):
+                updated_settings[section] = {
+                    **values,
+                    **updated_settings.get(section, {}),
+                }
+            elif section not in updated_settings:
+                updated_settings[section] = values
+        self.settings = updated_settings
         return self.settings
 
     def save_settings(self):
