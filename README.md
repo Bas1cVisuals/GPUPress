@@ -79,8 +79,16 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-Place compatible `ffmpeg.exe` and `ffprobe.exe` in the local `bin\` directory,
-then launch from the project root:
+FFmpeg binaries are intentionally excluded from this Git repository. The
+locally tested build used Gyan.dev FFmpeg 9.0.1. Obtain the corresponding
+`ffmpeg.exe` and `ffprobe.exe` files separately and verify the archive and
+executable SHA-256 hashes against
+[`third_party/ffmpeg/SOURCE.md`](third_party/ffmpeg/SOURCE.md); that record
+documents the exact Gyan archive and executable hashes. The hash match
+identifies the tested binaries, but does not establish a reproducible build or
+resolve all third-party source, notice, or licensing questions. Place the
+verified executables in the local `bin\` directory, then launch from the
+project root:
 
 ```powershell
 python run.py
@@ -126,23 +134,41 @@ python -m pip install -r requirements-dev.txt
 python build.py
 ```
 
-The result is `dist\GPUPress\GPUPress.exe`; distribute the complete onedir
-folder. **`build.py` removes the project-root `build\`, `dist\`, and generated
-`GPUPress.spec` before building. Back up anything in those locations that you
-need.**
+The build result is `dist\GPUPress\GPUPress.exe`. **`build.py` removes the
+project-root `build\`, `dist\`, and generated `GPUPress.spec` before building.
+Back up anything in those locations that you need.**
 
-The installer builder uses an existing onedir package and Inno Setup 6 or 7:
+The installer builder uses an existing onedir package and Inno Setup 6 or 7.
+The GPUPress 0.1.0 application build succeeded. The Windows installer was
+built locally and tested with Inno Setup 7.1.0:
 
 ```powershell
 python build_installer.py
 ```
 
 It stages into `build\installer-stage\` and writes
-`dist\installer\GPUPress-Setup-v0.1.0.exe`. The installer has not been built or
-validated as part of this release-hardening audit. The Start Menu shortcut is
-created by default; the Desktop shortcut is optional and unchecked by default.
-Uninstalling preserves user settings in
-`%LOCALAPPDATA%\BAS1C VISUALS\GPUPress\`.
+`dist\installer\GPUPress-Setup-v0.1.0.exe`. Its SHA-256 from local QA was
+`C931809B284EDE19E3FF77E88C02EC40E80E8F57F3A892A8149792B6EA03BD43`.
+A fresh installation into a temporary test directory, application startup,
+basic UI loading, and uninstall were tested. The uninstall test found a
+pre-existing `C:\Program Files\GPUPress` directory; its previous uninstall
+registration was replaced during installation. Uninstall removed the test
+registration and test directory, but did not remove that pre-existing
+directory, so the result should not be interpreted as a completely clean
+uninstall.
+
+Automated unit and generated-media tests cover many application functions.
+GUI batch processing, GUI cancellation, and end-to-end settings-save
+persistence were not independently verified through the installed GUI. The
+Start Menu shortcut is created by default; the Desktop shortcut is optional
+and unchecked by default.
+
+The source-code repository update and Windows installer have separate status:
+the source release remains GPUPress 0.1.0, but the installer has **not** been
+approved for public binary distribution. FFmpeg
+redistribution, complete dependency source and notice availability, full
+build provenance, and commercial licensing questions remain unresolved. Local
+build/testing is not legal or commercial clearance.
 
 The scripts locate an installed `ISCC.exe` by `INNO_SETUP_HOME`, `PATH`, or
 standard Inno Setup 6/7 install directories. They do not pin or check the
